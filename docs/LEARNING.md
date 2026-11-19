@@ -1,7 +1,10 @@
 # Learning path — Claude Agent SDK, by doing
 
-You're a frontend dev who learns by building and *seeing* results. This file is
-your curriculum: each phase has a concept, a way to **see it happen**, and a
+> My learning journal from building this repo, coming from 7+ years of
+> React/TypeScript. Kept here because it shows how the project grew step by step.
+
+Written for a frontend dev who learns by building and *seeing* results. This file is
+the curriculum: each phase has a concept, a way to **see it happen**, and a
 **task you implement yourself**. Work top to bottom. The whole thing runs on
 your Claude Code subscription (no API key).
 
