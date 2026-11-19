@@ -123,12 +123,37 @@ async def create_ticket(args: dict[str, Any]) -> dict[str, Any]:
     )
 
 
+_ESCALATIONS: list[dict[str, Any]] = []
+
+
+@tool(
+    "escalate_to_human",
+    "Hand the conversation to a human agent. Use this when the customer is "
+    "angry, asks for a refund or legal/security action, or explicitly asks for "
+    "a person. Requires human approval before it runs.",
+    {"reason": str, "summary": str, "urgency": str},
+)
+async def escalate_to_human(args: dict[str, Any]) -> dict[str, Any]:
+    urgency = args.get("urgency", "normal").lower()
+    if urgency not in {"low", "normal", "high"}:
+        return _text(
+            f"Invalid urgency {urgency!r}; use low, normal or high.", is_error=True
+        )
+    _ESCALATIONS.append(
+        {"reason": args["reason"], "summary": args["summary"], "urgency": urgency}
+    )
+    return _text(
+        f"Escalated to the human support queue (urgency={urgency}, "
+        f"position #{len(_ESCALATIONS)}). A person will reply to the customer."
+    )
+
+
 # --- In-process MCP server the agent connects to -----------------------------
 
 SUPPORT_SERVER = create_sdk_mcp_server(
     name="support",
     version="1.0.0",
-    tools=[lookup_ticket, search_kb, create_ticket],
+    tools=[lookup_ticket, search_kb, create_ticket, escalate_to_human],
 )
 
 # Tools are addressed as mcp__<server>__<tool> in allowed_tools.
@@ -136,4 +161,11 @@ ALLOWED_TOOLS = [
     "mcp__support__lookup_ticket",
     "mcp__support__search_kb",
     "mcp__support__create_ticket",
+    "mcp__support__escalate_to_human",
 ]
+
+# Side-effecting tools: a human must approve each call (see guardrails.py).
+APPROVAL_REQUIRED = {
+    "mcp__support__create_ticket",
+    "mcp__support__escalate_to_human",
+}
