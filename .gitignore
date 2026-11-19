@@ -7,3 +7,5 @@ __pycache__/
 python/
 
 .DS_Store
+traces/
+evals/report.json

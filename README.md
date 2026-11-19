@@ -1,99 +1,123 @@
 # claude-agent-lab
 
-A tiny Python learning app for **building an agent with custom tools**, built on
-the **Claude Agent SDK** (`claude-agent-sdk`) so it runs on your **Claude Code
-subscription** — no separate API key needed.
+[![ci](https://github.com/ArsenPoghosyanDev/claude-agent-lab/actions/workflows/ci.yml/badge.svg)](https://github.com/ArsenPoghosyanDev/claude-agent-lab/actions/workflows/ci.yml)
+![python](https://img.shields.io/badge/python-3.11%2B-blue)
+![license](https://img.shields.io/badge/license-MIT-green)
 
-It's a mock first-line **support agent**: the model answers customer questions
-by calling three custom tools — `lookup_ticket`, `search_kb`, and
-`create_ticket` — backed by in-memory fake data, so the only thing to study is
-the agent itself.
+A customer-support agent built on the **Claude Agent SDK** and **MCP**, with the
+pieces a production agent needs around the model: **tool calling**,
+**human-in-the-loop approval** for side-effecting actions, **tracing** of every
+tool call (latency, tokens, cost), **multi-agent routing**, and an **eval suite
+with LLM-as-judge** that runs in CI.
 
-This is the Python counterpart to the team's TS `claude-support-center` starter
-(which imports the same SDK family, `@anthropic-ai/claude-agent-sdk`).
+The tools use in-memory fake data on purpose, so the interesting part is the
+agent engineering rather than a backend.
 
-## Why the Agent SDK (and not the raw `anthropic` SDK)?
+## Architecture
 
-| | Raw `anthropic` Messages SDK | **Claude Agent SDK** (this app) |
-| --- | --- | --- |
-| Auth | needs a Console **API key** (pay-as-you-go) | uses the **`claude` CLI's** login = your **subscription** |
-| Loop | you write the tool loop by hand | the SDK drives the loop |
-| Tools | JSON-schema dicts | `@tool` functions in an in-process MCP server |
+```mermaid
+flowchart LR
+    U[Customer message] --> A[Support agent<br/>Claude Agent SDK]
+    A <-->|MCP, in-process| S[(support server)]
+    S --> T1[lookup_ticket]
+    S --> T2[search_kb]
+    S --> T3[create_ticket]
+    S --> T4[escalate_to_human]
+    A -. PreToolUse hook .-> G{Approval gate}
+    G -->|approve / deny| T3
+    G -->|approve / deny| T4
+    A -. Pre/PostToolUse hooks .-> TR[Tracer<br/>latency · tokens · cost → JSONL]
+    A --> R[Reply]
+    R --> J[LLM-as-judge<br/>evals/run_evals.py]
+```
 
-The Agent SDK shells out to the `claude` CLI, so it authenticates with whatever
-you're already logged into in Claude Code.
+| File | What it does |
+| --- | --- |
+| `tools.py` | Four `@tool` functions bundled into an in-process MCP server with `create_sdk_mcp_server`. Errors are returned with `is_error` so the model can recover. |
+| `guardrails.py` | `PreToolUse` hook that lets read-only tools run and sends `create_ticket` / `escalate_to_human` to an approver (terminal prompt, auto, or deny). Every decision is audit-logged. |
+| `tracing.py` | `Tracer` hooks record each tool call's input, latency and errors, plus the run's cost, turns and tokens from `ResultMessage`; written to `traces/*.jsonl`. |
+| `agent.py` | The agent: system prompt, tool allow-list, hooks, `query()` for one-shot and `ClaudeSDKClient` for multi-turn chat. |
+| `orchestrate.py` | Multi-agent routing: a triage agent classifies the request (billing / technical / account) and hands it to a specialist prompt. |
+| `web.py` | FastAPI viewer that streams text and tool calls to the browser over Server-Sent Events. |
+| `evals/` | 13 scenario cases (KB answers, ticket lookups, escalation, security report, prompt injection, no invented policies). Scored by tool-call checks plus an LLM judge. |
+| `tests/` | Offline unit tests for tools, the approval gate, the tracer and eval helpers (no model calls). |
 
-## Layout
+## Design choices
 
-| File              | What it teaches                                                      |
-| ----------------- | ------------------------------------------------------------------- |
-| `tools.py`        | Define tools with `@tool(...)`, bundle them via `create_sdk_mcp_server`. |
-| `agent.py`        | Run the agent with `query()` / `ClaudeSDKClient`, render text + tool calls. |
-| `web.py`          | Browser viewer — watch text + tool calls stream live (`uvicorn web:app`). |
-| **`LEARNING.md`** | **Start here** — 7-phase, learn-by-doing curriculum with tasks.        |
-| `requirements.txt`| `claude-agent-sdk`, `fastapi`, `uvicorn`.                             |
+- **Least privilege.** `allowed_tools` lists only the four support tools, so the
+  agent has no shell or file access.
+- **Approval only where it matters.** Reads never block; anything that changes
+  state or pulls in a person needs a yes. A denial is fed back to the model,
+  which tells the customer what happens next instead of pretending it worked.
+- **Evals as a gate.** Each case states which tools must and must not be
+  called, plus a rubric. A case passes only if the tool checks pass *and* the
+  judge scores it 4/5 or higher. CI fails below an 80% pass rate.
+- **Observable by default.** Every run prints a per-tool latency table with
+  the run's cost and tokens, and keeps a JSONL trace you can diff between
+  prompt or model changes.
 
-> New here? Open **`LEARNING.md`** — the guided path (how to *see* the agent
-> work, plus tasks for agent / context / errors / orchestration / LLM-as-judge).
-
-## Setup
-
-> ⚠️ Use a **native arm64** Python (this repo ships one in `./python/`). An
-> x86/Rosetta Python makes the SDK's `claude` subprocess hang with a
-> `CPU lacks AVX` warning.
+## Quick start
 
 ```bash
-cd ~/Apps/claude-agent-lab
-./python/bin/python3 -m venv .venv && source .venv/bin/activate
+python3 -m venv .venv && source .venv/bin/activate
 pip install -r requirements.txt
-unset ANTHROPIC_API_KEY
 ```
 
-**Auth — use your Claude Code subscription.** The only rule:
+Auth uses your Claude Code login (the SDK drives the bundled `claude` CLI).
+Make sure `ANTHROPIC_API_KEY` is unset, or it will bill the API instead. For CI
+or a headless machine, run `claude setup-token` and export
+`CLAUDE_CODE_OAUTH_TOKEN`.
 
 ```bash
-unset ANTHROPIC_API_KEY   # if set, it takes precedence and bills the API instead
+python agent.py                                   # canned demo question
+python agent.py "How do I rotate my API key?"     # your own question
+python agent.py -i                                # multi-turn chat
+APPROVAL_MODE=auto python agent.py "I want a refund and a real person"
+python orchestrate.py "I was charged twice"       # triage → specialist
+uvicorn web:app --reload                          # browser viewer on :8000
 ```
 
-Because you're already logged into Claude Code, that's it. For a headless /CI
-machine, mint a portable token instead:
+Example output (abridged, numbers vary):
+
+```text
+you> I want a refund and a real person
+agent>
+  -> [escalate_to_human({'reason': 'refund request', 'urgency': 'high', ...})]
+  [approval needed] escalate_to_human(...)
+  approve? [y/N] y
+I've passed this to our support team with high priority...
+
+trace: ask
+  escalate_to_human      2.1 ms
+  total 6120 ms | turns 2 | tokens in/out 1830/212 | ~$0.0031
+```
+
+## Tests and evals
 
 ```bash
-claude setup-token
-export CLAUDE_CODE_OAUTH_TOKEN=...   # value printed by the command
+pip install pytest
+pytest -q tests                                   # offline, < 1 s
+APPROVAL_MODE=auto python -m evals.run_evals      # runs the agent + judge
+python -m evals.run_evals --only angry-refund prompt-injection
 ```
 
-## Run
+`evals/report.json` keeps every reply, the tools called, the judge's score and
+reason, and the cost per case.
 
-```bash
-python agent.py                      # canned demo question
-python agent.py "How do I rotate my API key?"   # ask your own
-python agent.py -i                   # interactive chat (keeps session context)
-```
+## Roadmap
 
-You'll see assistant text plus a `-> [tool(args)]` line each time the agent
-calls a tool, so the loop is visible end to end.
+- Swap keyword `search_kb` for embedding search (pgvector) and add retrieval
+  evals. This is a learning item for me, not production work yet.
+- Approval UI in the web viewer (today it blocks side-effecting tools unless
+  `APPROVAL_MODE=auto`).
+- Export traces to OpenTelemetry.
 
-## How it works, in one paragraph
+## Background
 
-`tools.py` defines three async `@tool` functions and wraps them in an
-in-process MCP server. `agent.py` passes that server to `ClaudeAgentOptions`
-(`mcp_servers=...`, `allowed_tools=[...]`) and runs the agent with `query()`
-(one-shot) or `ClaudeSDKClient` (multi-turn). The SDK runs the whole agent loop
-— deciding when to call tools, executing them, feeding results back — and yields
-`AssistantMessage` (text + `ToolUseBlock`s) and a final `ResultMessage`. Tool
-names are addressed as `mcp__support__<tool>`.
+I built this while learning the Claude Agent SDK alongside my day job as a
+full-stack engineer. `docs/LEARNING.md` and `docs/PROGRESS.md` are the
+step-by-step journal.
 
-## Things to try next
+## License
 
-- Add a tool (e.g. `escalate_to_human`): write a `@tool` fn in `tools.py`, add
-  it to `create_sdk_mcp_server(tools=[...])` and to `ALLOWED_TOOLS`.
-- Switch `MODEL` in `agent.py` between `"sonnet"`, `"opus"`, `"haiku"`.
-- Tighten/loosen `max_turns` and watch the loop length change.
-- Compare against the raw-SDK approach (needs a Console API key) to feel the
-  difference between "drive the loop yourself" and "let the SDK drive it".
-
-## Note on usage
-
-Runs draw from your Claude Code subscription quota. `"sonnet"` is the default
-here to keep that modest while you experiment.
+MIT
