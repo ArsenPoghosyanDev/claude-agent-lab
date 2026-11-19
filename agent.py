@@ -6,14 +6,16 @@ Claude Code subscription. (Make sure ANTHROPIC_API_KEY is NOT set, or it bills
 the API instead. Headless/CI: run `claude setup-token` and export the printed
 CLAUDE_CODE_OAUTH_TOKEN.)
 
-The agent answers support questions using three custom in-process tools defined
-in tools.py. The SDK drives the agent loop for you — you just iterate the
-messages it yields.
+The agent answers support questions using four custom in-process tools defined
+in tools.py. Side-effecting tools (create_ticket, escalate_to_human) need human
+approval (guardrails.py), and every tool call is traced with latency and the
+run's cost (tracing.py).
 
 Run it:
     python agent.py                 # one canned demo question
     python agent.py "your question" # ask your own
     python agent.py -i              # interactive chat (keeps session context)
+    APPROVAL_MODE=auto python agent.py "..."   # skip the approval prompt
 """
 
 from __future__ import annotations
@@ -31,7 +33,9 @@ from claude_agent_sdk import (
     query,
 )
 
+from guardrails import Approver, approval_hooks, approver_from_env
 from tools import ALLOWED_TOOLS, SUPPORT_SERVER
+from tracing import Tracer, merge_hooks
 
 # "haiku" = lightest on your subscription allowance — good default for practice.
 # Use "sonnet" for better answers, "opus" for the strongest model.
@@ -41,16 +45,28 @@ SYSTEM_PROMPT = (
     "You are a first-line support agent for a SaaS product. "
     "Use the tools to look up tickets and search the knowledge base before "
     "answering. Be concise and friendly. If you can't resolve an issue from "
-    "the knowledge base, open a ticket. Always end with a clear next step."
+    "the knowledge base, open a ticket. If the customer is angry, asks for a "
+    "refund, reports a security problem, or asks for a person, escalate to a "
+    "human. Never invent ticket ids, policies or refunds. If an action is not "
+    "approved, say so and tell the customer what happens next. "
+    "Always end with a clear next step."
 )
 
 
-def _options() -> ClaudeAgentOptions:
+def _options(
+    approver: Approver | None = None,
+    tracer: Tracer | None = None,
+    audit_log: list | None = None,
+) -> ClaudeAgentOptions:
+    hooks = {"PreToolUse": approval_hooks(approver or approver_from_env(), audit_log)}
+    if tracer is not None:
+        hooks = merge_hooks(tracer.hooks(), hooks)
     return ClaudeAgentOptions(
         model=MODEL,
         system_prompt=SYSTEM_PROMPT,
         mcp_servers={"support": SUPPORT_SERVER},
         allowed_tools=ALLOWED_TOOLS,  # whitelist: only our tools, no bash/file access
+        hooks=hooks,
         max_turns=8,
     )
 
@@ -74,8 +90,13 @@ def _print_message(message) -> None:
 
 async def ask_once(question: str) -> None:
     print(f"you> {question}\nagent>")
-    async for message in query(prompt=question, options=_options()):
+    tracer = Tracer(run_name="ask")
+    async for message in query(prompt=question, options=_options(tracer=tracer)):
         _print_message(message)
+        if isinstance(message, ResultMessage):
+            tracer.record_result(message)
+    print("\n" + tracer.summary())
+    print(f"  trace written to {tracer.flush()}")
 
 
 async def interactive() -> None:

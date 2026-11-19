@@ -1,4 +1,4 @@
-"""Browser viewer for the agent — the "see it like a FE dev" surface.
+"""Browser viewer for the agent — watch the agent loop live.
 
 Runs the same agent as agent.py, but streams every step (assistant text, each
 tool call, the final result) to a web page over Server-Sent Events. Open it,
@@ -15,6 +15,7 @@ Run:
 from __future__ import annotations
 
 import json
+import os
 
 from claude_agent_sdk import (
     AssistantMessage,
@@ -27,6 +28,11 @@ from fastapi import FastAPI
 from fastapi.responses import HTMLResponse, StreamingResponse
 
 from agent import _options  # reuse the exact same agent config
+from guardrails import approver_from_env, deny_approver
+
+# The browser viewer has no approval UI yet: side-effecting tools are blocked
+# unless you start it with APPROVAL_MODE=auto.
+_WEB_APPROVER = approver_from_env() if os.environ.get("APPROVAL_MODE") == "auto" else deny_approver
 
 app = FastAPI()
 
@@ -82,7 +88,7 @@ def _sse(kind: str, text: str) -> str:
 @app.get("/ask")
 async def ask(q: str) -> StreamingResponse:
     async def stream():
-        async for message in query(prompt=q, options=_options()):
+        async for message in query(prompt=q, options=_options(approver=_WEB_APPROVER)):
             if isinstance(message, AssistantMessage):
                 for block in message.content:
                     if isinstance(block, TextBlock):
